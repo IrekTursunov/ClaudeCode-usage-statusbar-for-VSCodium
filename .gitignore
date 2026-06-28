@@ -1,0 +1,21 @@
+# Node / packaging
+node_modules/
+*.vsix
+*.log
+*.tsbuildinfo
+
+# VS Code extension test runtime
+.vscode-test/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Secrets — never commit. Credentials live in ~/.claude/.credentials.json
+# (outside this repo); these patterns are a safety net only.
+.credentials.json
+*.credentials.json
+.env
+.env.*

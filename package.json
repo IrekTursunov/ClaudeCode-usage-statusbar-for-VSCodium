@@ -1,0 +1,56 @@
+{
+  "name": "claude-usage-statusbar",
+  "displayName": "Claude Code Usage (status bar)",
+  "description": "Shows live Session and Weekly Claude Code usage % (from Anthropic's usage API) with colored progress bars.",
+  "version": "0.2.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "activationEvents": ["*"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "claudeUsage.refresh", "title": "Claude Usage: Refresh" }
+    ],
+    "configuration": {
+      "title": "Claude Code Usage",
+      "properties": {
+        "claudeUsage.credentialsPath": {
+          "type": "string",
+          "default": "~/.claude/.credentials.json",
+          "description": "Path to the Claude Code OAuth credentials file (read locally; the token is sent only to api.anthropic.com)."
+        },
+        "claudeUsage.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "How often to poll the usage endpoint (seconds; min 15)."
+        },
+        "claudeUsage.barSegments": {
+          "type": "number",
+          "default": 7,
+          "description": "Number of segments in each progress bar."
+        },
+        "claudeUsage.warnThreshold": {
+          "type": "number",
+          "default": 60,
+          "description": "Percent at which the gauge turns yellow."
+        },
+        "claudeUsage.highThreshold": {
+          "type": "number",
+          "default": 80,
+          "description": "Percent at which the gauge turns orange (warning background)."
+        },
+        "claudeUsage.criticalThreshold": {
+          "type": "number",
+          "default": 95,
+          "description": "Percent at which the gauge turns red (error background)."
+        },
+        "claudeUsage.betaHeader": {
+          "type": "string",
+          "default": "oauth-2025-04-20",
+          "description": "Value of the anthropic-beta header required by the OAuth usage endpoint."
+        }
+      }
+    }
+  }
+}
