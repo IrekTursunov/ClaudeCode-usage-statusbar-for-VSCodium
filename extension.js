@@ -6,18 +6,27 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const os = require('os');
+const path = require('path');
 const https = require('https');
 
 let sessionItem, weeklyItem, timer;
 let hasData = false;     // have we ever rendered real values?
 let backoffUntil = 0;    // skip polling until this timestamp (ms) after a 429
+let activityTimer;       // local poll of Claude Code logs
+let debounceTimer;       // settle timer before an activity-triggered refresh
+let lastLogMtime = 0;    // newest .jsonl mtime seen so far
+let lastApiAttempt = 0;  // when refresh() last hit the network
 
 function getCfg() {
   const c = vscode.workspace.getConfiguration('claudeUsage');
   const home = os.homedir();
   return {
     credentialsPath: (c.get('credentialsPath') || '~/.claude/.credentials.json').replace(/^~(?=$|[/\\])/, home),
-    refreshSeconds: c.get('refreshIntervalSeconds', 120),
+    refreshSeconds: c.get('refreshIntervalSeconds', 300),
+    syncToActivity: c.get('syncToActivity', true),
+    activityPollSeconds: c.get('activityPollSeconds', 5),
+    activityDebounceSeconds: c.get('activityDebounceSeconds', 4),
+    activityMinIntervalSeconds: c.get('activityMinIntervalSeconds', 20),
     segments: c.get('barSegments', 7),
     warn: c.get('warnThreshold', 60),
     high: c.get('highThreshold', 80),
@@ -195,6 +204,7 @@ function showError(kind) {
 
 async function refresh() {
   if (Date.now() < backoffUntil) return; // still backing off from a 429
+  lastApiAttempt = Date.now();
   const cfg = getCfg();
   const r = await fetchUsage(cfg);
   if (r.error) {
@@ -222,6 +232,53 @@ function startTimer() {
   timer = setInterval(refresh, Math.max(15, getCfg().refreshSeconds) * 1000);
 }
 
+// ~/.claude/projects — where Claude Code appends per-request session logs.
+function logsDir(cfg) {
+  return path.join(path.dirname(cfg.credentialsPath), 'projects');
+}
+
+// Newest mtime (ms) across all session *.jsonl logs, or 0 if none/unreadable.
+// This is a local stat only — it never touches the network.
+function newestLogMtime(cfg) {
+  let newest = 0;
+  try {
+    const root = logsDir(cfg);
+    for (const proj of fs.readdirSync(root)) {
+      const dir = path.join(root, proj);
+      let entries;
+      try { entries = fs.readdirSync(dir); } catch { continue; }
+      for (const f of entries) {
+        if (!f.endsWith('.jsonl')) continue;
+        try {
+          const m = fs.statSync(path.join(dir, f)).mtimeMs;
+          if (m > newest) newest = m;
+        } catch { /* ignore */ }
+      }
+    }
+  } catch { /* projects dir missing — leave 0 */ }
+  return newest;
+}
+
+// Debounced, rate-guarded refresh after request activity settles.
+function scheduleActivityRefresh(cfg) {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    if (Date.now() - lastApiAttempt >= cfg.activityMinIntervalSeconds * 1000) refresh();
+  }, Math.max(1, cfg.activityDebounceSeconds) * 1000);
+}
+
+// Poll the logs locally; when a request is logged, trigger a refresh.
+function startActivityWatch(cfg) {
+  if (activityTimer) clearInterval(activityTimer);
+  if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = undefined; }
+  if (!cfg.syncToActivity) return;
+  lastLogMtime = newestLogMtime(cfg);
+  activityTimer = setInterval(() => {
+    const m = newestLogMtime(cfg);
+    if (m > lastLogMtime) { lastLogMtime = m; scheduleActivityRefresh(cfg); }
+  }, Math.max(1, cfg.activityPollSeconds) * 1000);
+}
+
 function activate(context) {
   sessionItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   weeklyItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
@@ -230,15 +287,20 @@ function activate(context) {
     sessionItem, weeklyItem,
     vscode.commands.registerCommand('claudeUsage.refresh', refresh),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('claudeUsage')) { startTimer(); refresh(); }
+      if (e.affectsConfiguration('claudeUsage')) {
+        startTimer(); startActivityWatch(getCfg()); refresh();
+      }
     })
   );
   refresh();
   startTimer();
+  startActivityWatch(getCfg());
 }
 
 function deactivate() {
   if (timer) clearInterval(timer);
+  if (activityTimer) clearInterval(activityTimer);
+  if (debounceTimer) clearTimeout(debounceTimer);
 }
 
 module.exports = { activate, deactivate };

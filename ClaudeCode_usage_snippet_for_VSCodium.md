@@ -91,6 +91,27 @@ Each item picks its color from **its own** percentage. Thresholds are configurab
 
 ---
 
+## 3a. Activity‑synced refresh
+
+Instead of relying only on a fixed poll, the extension refreshes **shortly after real Claude Code
+request activity**. Claude Code appends to its session log
+`~/.claude/projects/<workspace>/<id>.jsonl` on every request, and usage is **account‑wide**, so the
+newest mtime across **all** project logs is a reliable "a request just happened" signal.
+
+- Detecting activity is a **local file stat** (`fs.statSync` mtime) — it never calls the usage API,
+  so it can run every few seconds (`activityPollSeconds`, default 5) cheaply.
+- When the newest `.jsonl` mtime advances, a **debounced** refresh fires (`activityDebounceSeconds`,
+  default 4) so a burst of requests collapses into one API call.
+- Activity‑triggered API calls are spaced by at least `activityMinIntervalSeconds` (default 20) and
+  still obey the 429 backoff, protecting the rate limit during heavy use.
+- `refreshIntervalSeconds` (now default 300) remains only as an **idle safety net** — to catch window
+  resets and the idle case. Toggle the whole behavior with `syncToActivity`.
+
+**Caveat:** this tracks *local* request activity, not the exact server‑side counter, so expect a
+few‑second lag (debounce + the API's own update latency).
+
+---
+
 ## 4. Data source
 
 **Endpoint:** `GET https://api.anthropic.com/api/oauth/usage` — the OAuth endpoint that backs Claude
@@ -135,7 +156,9 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
 3. `pct = round(utilization)`, render `$(icon) <S|W> <pct>% <bar>` with the color from §3, followed
    by the sand-timer reset gauge (§2a, no text), and a tooltip showing the % and the colored
    time-left drain.
-4. Repeat every `refreshIntervalSeconds` (default 60, min 15) and on demand via `claudeUsage.refresh`.
+4. Refresh shortly after request activity (§3a, debounced from local `.jsonl` log writes), with
+   `refreshIntervalSeconds` (default 300, min 15) as an idle safety net, plus on demand via
+   `claudeUsage.refresh`.
 5. On `401` / parse errors, show a muted `—` state with an explanatory tooltip. **Transient** errors
    (HTTP 429, 5xx, network, timeout) are **swallowed once data exists** — the last good values stay
    on screen instead of flashing an error. On HTTP 429 the extension **backs off** (honoring the
@@ -150,7 +173,7 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
   "name": "claude-usage-statusbar",
   "displayName": "Claude Code Usage (status bar)",
   "description": "Shows live Session and Weekly Claude Code usage % (from Anthropic's usage API) with colored progress bars.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publisher": "local",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
@@ -170,8 +193,8 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
         },
         "claudeUsage.refreshIntervalSeconds": {
           "type": "number",
-          "default": 120,
-          "description": "How often to poll the usage endpoint (seconds; min 15). The extension also backs off automatically when rate-limited (HTTP 429)."
+          "default": 300,
+          "description": "Idle safety-net poll interval (seconds; min 15). With syncToActivity on, refreshes are mainly driven by request activity; this timer just catches resets/idle. The extension also backs off automatically when rate-limited (HTTP 429)."
         },
         "claudeUsage.barSegments": {
           "type": "number",
@@ -197,6 +220,26 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
           "type": "string",
           "default": "oauth-2025-04-20",
           "description": "Value of the anthropic-beta header required by the OAuth usage endpoint."
+        },
+        "claudeUsage.syncToActivity": {
+          "type": "boolean",
+          "default": true,
+          "description": "Refresh usage shortly after real Claude Code request activity (detected locally from ~/.claude/projects/*.jsonl log writes) instead of only on the timer."
+        },
+        "claudeUsage.activityPollSeconds": {
+          "type": "number",
+          "default": 5,
+          "description": "How often to check the Claude Code logs locally for new activity (seconds). This is a local file stat only; it never calls the usage API."
+        },
+        "claudeUsage.activityDebounceSeconds": {
+          "type": "number",
+          "default": 4,
+          "description": "How long to wait after the last logged request before refreshing usage, so a burst of requests triggers a single refresh."
+        },
+        "claudeUsage.activityMinIntervalSeconds": {
+          "type": "number",
+          "default": 20,
+          "description": "Minimum gap between activity-triggered usage API calls, to protect the rate limit during heavy use."
         },
         "claudeUsage.showResetGauge": {
           "type": "boolean",
@@ -250,18 +293,27 @@ no npm install.
 const vscode = require('vscode');
 const fs = require('fs');
 const os = require('os');
+const path = require('path');
 const https = require('https');
 
 let sessionItem, weeklyItem, timer;
 let hasData = false;     // have we ever rendered real values?
 let backoffUntil = 0;    // skip polling until this timestamp (ms) after a 429
+let activityTimer;       // local poll of Claude Code logs
+let debounceTimer;       // settle timer before an activity-triggered refresh
+let lastLogMtime = 0;    // newest .jsonl mtime seen so far
+let lastApiAttempt = 0;  // when refresh() last hit the network
 
 function getCfg() {
   const c = vscode.workspace.getConfiguration('claudeUsage');
   const home = os.homedir();
   return {
     credentialsPath: (c.get('credentialsPath') || '~/.claude/.credentials.json').replace(/^~(?=$|[/\\])/, home),
-    refreshSeconds: c.get('refreshIntervalSeconds', 120),
+    refreshSeconds: c.get('refreshIntervalSeconds', 300),
+    syncToActivity: c.get('syncToActivity', true),
+    activityPollSeconds: c.get('activityPollSeconds', 5),
+    activityDebounceSeconds: c.get('activityDebounceSeconds', 4),
+    activityMinIntervalSeconds: c.get('activityMinIntervalSeconds', 20),
     segments: c.get('barSegments', 7),
     warn: c.get('warnThreshold', 60),
     high: c.get('highThreshold', 80),
@@ -439,6 +491,7 @@ function showError(kind) {
 
 async function refresh() {
   if (Date.now() < backoffUntil) return; // still backing off from a 429
+  lastApiAttempt = Date.now();
   const cfg = getCfg();
   const r = await fetchUsage(cfg);
   if (r.error) {
@@ -466,6 +519,53 @@ function startTimer() {
   timer = setInterval(refresh, Math.max(15, getCfg().refreshSeconds) * 1000);
 }
 
+// ~/.claude/projects — where Claude Code appends per-request session logs.
+function logsDir(cfg) {
+  return path.join(path.dirname(cfg.credentialsPath), 'projects');
+}
+
+// Newest mtime (ms) across all session *.jsonl logs, or 0 if none/unreadable.
+// This is a local stat only — it never touches the network.
+function newestLogMtime(cfg) {
+  let newest = 0;
+  try {
+    const root = logsDir(cfg);
+    for (const proj of fs.readdirSync(root)) {
+      const dir = path.join(root, proj);
+      let entries;
+      try { entries = fs.readdirSync(dir); } catch { continue; }
+      for (const f of entries) {
+        if (!f.endsWith('.jsonl')) continue;
+        try {
+          const m = fs.statSync(path.join(dir, f)).mtimeMs;
+          if (m > newest) newest = m;
+        } catch { /* ignore */ }
+      }
+    }
+  } catch { /* projects dir missing — leave 0 */ }
+  return newest;
+}
+
+// Debounced, rate-guarded refresh after request activity settles.
+function scheduleActivityRefresh(cfg) {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    if (Date.now() - lastApiAttempt >= cfg.activityMinIntervalSeconds * 1000) refresh();
+  }, Math.max(1, cfg.activityDebounceSeconds) * 1000);
+}
+
+// Poll the logs locally; when a request is logged, trigger a refresh.
+function startActivityWatch(cfg) {
+  if (activityTimer) clearInterval(activityTimer);
+  if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = undefined; }
+  if (!cfg.syncToActivity) return;
+  lastLogMtime = newestLogMtime(cfg);
+  activityTimer = setInterval(() => {
+    const m = newestLogMtime(cfg);
+    if (m > lastLogMtime) { lastLogMtime = m; scheduleActivityRefresh(cfg); }
+  }, Math.max(1, cfg.activityPollSeconds) * 1000);
+}
+
 function activate(context) {
   sessionItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   weeklyItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
@@ -474,15 +574,20 @@ function activate(context) {
     sessionItem, weeklyItem,
     vscode.commands.registerCommand('claudeUsage.refresh', refresh),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('claudeUsage')) { startTimer(); refresh(); }
+      if (e.affectsConfiguration('claudeUsage')) {
+        startTimer(); startActivityWatch(getCfg()); refresh();
+      }
     })
   );
   refresh();
   startTimer();
+  startActivityWatch(getCfg());
 }
 
 function deactivate() {
   if (timer) clearInterval(timer);
+  if (activityTimer) clearInterval(activityTimer);
+  if (debounceTimer) clearTimeout(debounceTimer);
 }
 
 module.exports = { activate, deactivate };

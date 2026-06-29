@@ -2,7 +2,7 @@
   "name": "claude-usage-statusbar",
   "displayName": "Claude Code Usage (status bar)",
   "description": "Shows live Session and Weekly Claude Code usage % (from Anthropic's usage API) with colored progress bars.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publisher": "local",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
@@ -22,8 +22,8 @@
         },
         "claudeUsage.refreshIntervalSeconds": {
           "type": "number",
-          "default": 120,
-          "description": "How often to poll the usage endpoint (seconds; min 15). The extension also backs off automatically when rate-limited (HTTP 429)."
+          "default": 300,
+          "description": "Idle safety-net poll interval (seconds; min 15). With syncToActivity on, refreshes are mainly driven by request activity; this timer just catches resets/idle. The extension also backs off automatically when rate-limited (HTTP 429)."
         },
         "claudeUsage.barSegments": {
           "type": "number",
@@ -49,6 +49,26 @@
           "type": "string",
           "default": "oauth-2025-04-20",
           "description": "Value of the anthropic-beta header required by the OAuth usage endpoint."
+        },
+        "claudeUsage.syncToActivity": {
+          "type": "boolean",
+          "default": true,
+          "description": "Refresh usage shortly after real Claude Code request activity (detected locally from ~/.claude/projects/*.jsonl log writes) instead of only on the timer."
+        },
+        "claudeUsage.activityPollSeconds": {
+          "type": "number",
+          "default": 5,
+          "description": "How often to check the Claude Code logs locally for new activity (seconds). This is a local file stat only; it never calls the usage API."
+        },
+        "claudeUsage.activityDebounceSeconds": {
+          "type": "number",
+          "default": 4,
+          "description": "How long to wait after the last logged request before refreshing usage, so a burst of requests triggers a single refresh."
+        },
+        "claudeUsage.activityMinIntervalSeconds": {
+          "type": "number",
+          "default": 20,
+          "description": "Minimum gap between activity-triggered usage API calls, to protect the rate limit during heavy use."
         },
         "claudeUsage.showResetGauge": {
           "type": "boolean",

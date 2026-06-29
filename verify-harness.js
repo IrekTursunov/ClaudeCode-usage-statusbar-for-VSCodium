@@ -2,7 +2,7 @@
 // Calls the same endpoint the extension uses and prints what it will display.
 //   node verify-harness.js
 //   ELECTRON_RUN_AS_NODE=1 /usr/share/codium/codium verify-harness.js
-const fs = require('fs'), os = require('os'), https = require('https');
+const fs = require('fs'), os = require('os'), path = require('path'), https = require('https');
 
 const credPath = os.homedir() + '/.claude/.credentials.json';
 const o = (JSON.parse(fs.readFileSync(credPath, 'utf8')).claudeAiOauth) || {};
@@ -43,6 +43,33 @@ function gauge(reset, windowMs) {
   const f = fracLeft(reset, windowMs);
   return f != null ? `  ${sandGlyph(f)}${sandBar(f, 3)}` : '';
 }
+
+// Mirror the activity-sync log signal (local stat only, no network).
+function logsDir() { return path.join(path.dirname(credPath), 'projects'); }
+function newestLogMtime() {
+  let newest = 0;
+  try {
+    const root = logsDir();
+    for (const proj of fs.readdirSync(root)) {
+      const dir = path.join(root, proj);
+      let entries; try { entries = fs.readdirSync(dir); } catch { continue; }
+      for (const f of entries) {
+        if (!f.endsWith('.jsonl')) continue;
+        try { const m = fs.statSync(path.join(dir, f)).mtimeMs; if (m > newest) newest = m; } catch {}
+      }
+    }
+  } catch {}
+  return newest;
+}
+
+// Offline check of the activity-sync signal.
+(function activityCheck() {
+  const dir = logsDir(), m = newestLogMtime();
+  const age = m ? Math.round((Date.now() - m) / 1000) + 's ago' : 'no logs found';
+  console.log('--- activity sync signal ---');
+  console.log(`  logsDir: ${dir}`);
+  console.log(`  newest .jsonl write: ${age}\n`);
+})();
 
 // Offline self-check of the sand-timer gauge across the window (incl. null reset).
 (function selfCheck() {
