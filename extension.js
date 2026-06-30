@@ -191,6 +191,7 @@ function renderItem(item, icon, label, name, pct, reset, cfg, windowMs) {
 }
 
 function showError(kind) {
+  stopStale(); // a real error must not be overwritten by the stale animation
   const msg = {
     'no-token': 'No Claude credentials found (~/.claude/.credentials.json).',
     'auth': 'Login expired — open Claude Code and run /usage to refresh auth.',
