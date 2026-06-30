@@ -46,8 +46,9 @@ A **second** dimension — how much **time is left** in the window before it res
 
 - **Glyph:** `⏳` while sand is running, flipping to `⌛` when the window is nearly empty.
 - **Drain:** a short braille bar (`⣿⣧⠀` …) that empties left‑to‑right at sub‑cell resolution
-  (`⠀⡀⡄⡆⡇⣇⣧⣷⣿`), giving smooth motion across the whole window. The exact `resets_at` countdown is
-  intentionally **not** shown as text — the draining sand carries it (hover for the colored gauge).
+  (`⠀⡀⡄⡆⡇⣇⣧⣷⣿`), giving smooth motion across the whole window. The inline gauge carries the
+  countdown visually; the exact `resets_at` time-remaining is shown as plain text (e.g. `5h 30m`)
+  on the hover tooltip's "Resets in:" line.
 - **Window length** is a known constant (Session 5h, Weekly 7d; both configurable) — the API returns
   `resets_at` but not the window start, so `fracLeft = clamp((resets_at − now) / windowMs, 0, 1)`.
 - **Inline color note:** a status‑bar item carries only **one** foreground color, already owned by
@@ -154,8 +155,8 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
 1. Read `accessToken` + `expiresAt` from `~/.claude/.credentials.json`.
 2. `GET /api/oauth/usage`; on `200`, parse `five_hour` / `seven_day`.
 3. `pct = round(utilization)`, render `$(icon) <S|W> <pct>% <bar>` with the color from §3, followed
-   by the sand-timer reset gauge (§2a, no text), and a tooltip showing the % and the colored
-   time-left drain.
+   by the sand-timer reset gauge (§2a, no text), and a tooltip showing the % and the time
+   remaining until reset as plain text (e.g. `5h 30m`).
 4. Refresh shortly after request activity (§3a, debounced from local `.jsonl` log writes), with
    `refreshIntervalSeconds` (default 300, min 15) as an idle safety net, plus on demand via
    `claudeUsage.refresh`.
@@ -462,9 +463,8 @@ function renderItem(item, icon, label, name, pct, reset, cfg, windowMs) {
   md.supportHtml = true;
   md.appendMarkdown(`**Claude Code — ${name} usage**\n\n`);
   md.appendMarkdown(`- Used: **${p}%** ${bar(p, cfg.segments)}\n`);
-  if (f != null) {
-    const drain = `<span style="color:${timeColorHex(f, cfg)};">${sandBar(f, cfg.segments)}</span>`;
-    md.appendMarkdown(`- Resets in: ${sandGlyph(f)} ${drain}\n`);
+  if (r != null) {
+    md.appendMarkdown(`- Resets in: **${r}**\n`);
   }
   md.appendMarkdown('\n_Live from api.anthropic.com/api/oauth/usage. Click to refresh._');
   item.tooltip = md;

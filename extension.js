@@ -175,9 +175,8 @@ function renderItem(item, icon, label, name, pct, reset, cfg, windowMs) {
   md.supportHtml = true;
   md.appendMarkdown(`**Claude Code — ${name} usage**\n\n`);
   md.appendMarkdown(`- Used: **${p}%** ${bar(p, cfg.segments)}\n`);
-  if (f != null) {
-    const drain = `<span style="color:${timeColorHex(f, cfg)};">${sandBar(f, cfg.segments)}</span>`;
-    md.appendMarkdown(`- Resets in: ${sandGlyph(f)} ${drain}\n`);
+  if (r != null) {
+    md.appendMarkdown(`- Resets in: **${r}**\n`);
   }
   md.appendMarkdown('\n_Live from api.anthropic.com/api/oauth/usage. Click to refresh._');
   item.tooltip = md;
