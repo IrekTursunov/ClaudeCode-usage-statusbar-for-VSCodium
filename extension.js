@@ -16,6 +16,10 @@ let activityTimer;       // local poll of Claude Code logs
 let debounceTimer;       // settle timer before an activity-triggered refresh
 let lastLogMtime = 0;    // newest .jsonl mtime seen so far
 let lastApiAttempt = 0;  // when refresh() last hit the network
+let lastValues = null;   // [{ item, icon, label, name, pct, reset, windowMs }] last good render
+let lastGoodAt = 0;      // when lastValues was captured (ms)
+let staleTimer;          // spinner animation interval while showing stale values
+let spinFrame = 0;       // spinner frame index
 
 function getCfg() {
   const c = vscode.workspace.getConfiguration('claudeUsage');
@@ -119,6 +123,8 @@ function sandGlyph(frac) {
 
 // Short braille "sand drain": leftmost cells stay full, draining toward empty.
 const SAND = ['⠀', '⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿']; // empty → full (9 levels)
+// Braille spinner frames cycled while showing stale (rate-limited) values.
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 function sandBar(frac, cells) {
   const total = cells * (SAND.length - 1);
   let units = Math.round(frac * total);
@@ -202,6 +208,50 @@ function showError(kind) {
   }
 }
 
+// Re-render both items from the last good values, greyed, with the current
+// spinner frame — signals "stale, refreshing" without losing the numbers.
+function renderStale() {
+  if (!lastValues) return;
+  const spin = SPINNER[spinFrame % SPINNER.length];
+  const since = Math.max(0, Math.round((Date.now() - lastGoodAt) / 1000));
+  const ago = since >= 60 ? `${Math.floor(since / 60)}m ${since % 60}s` : `${since}s`;
+  for (const v of lastValues) {
+    const { item, icon, label, name, pct, reset, windowMs, cfg } = v;
+    let text = `$(${icon}) ${spin} ${label}`;
+    if (pct != null) {
+      const p = Math.round(pct);
+      text += ` ${p}% ${bar(p, cfg.segments)}`;
+      const f = fracLeft(reset, windowMs);
+      if (cfg.showResetGauge && f != null) text += `  ${sandGlyph(f)}${sandBar(f, 3)}`;
+    } else {
+      text += ' —';
+    }
+    item.text = text;
+    item.color = new vscode.ThemeColor('descriptionForeground');
+    item.backgroundColor = undefined;
+    const md = new vscode.MarkdownString(undefined, true);
+    md.appendMarkdown(`**Claude Code — ${name} usage** _(stale)_\n\n`);
+    if (pct != null) md.appendMarkdown(`- Last known: **${Math.round(pct)}%** ${bar(Math.round(pct), cfg.segments)}\n`);
+    md.appendMarkdown(`\n${spin} Rate-limited / offline — backing off. Last updated ${ago} ago. Click to retry.`);
+    item.tooltip = md;
+    item.show();
+  }
+}
+
+// Begin (or keep) the greyed stale animation. No-op if we never had data.
+function startStale() {
+  if (!lastValues || staleTimer) return;
+  renderStale();
+  staleTimer = setInterval(() => {
+    spinFrame = (spinFrame + 1) % SPINNER.length;
+    renderStale();
+  }, 600);
+}
+
+function stopStale() {
+  if (staleTimer) { clearInterval(staleTimer); staleTimer = undefined; }
+}
+
 async function refresh() {
   if (Date.now() < backoffUntil) return; // still backing off from a 429
   lastApiAttempt = Date.now();
@@ -214,15 +264,21 @@ async function refresh() {
     // Swallow transient errors once we have data — keep the last good values visible.
     const transient = r.error === 'http-429' || r.error === 'network' ||
       r.error === 'timeout' || /^http-5/.test(r.error);
-    if (transient && hasData) return;
+    if (transient && hasData) { startStale(); return; }
     return showError(r.error);
   }
   hasData = true;
   backoffUntil = 0;
+  stopStale();
   const s = pick(r.data, 'five_hour', 'session');
   const w = pick(r.data, 'seven_day', 'weekly');
   const sessionMs = cfg.sessionWindowHours * 3600e3;
   const weeklyMs = cfg.weeklyWindowDays * 86400e3;
+  lastValues = [
+    { item: sessionItem, icon: 'pulse', label: 'S', name: 'Session', pct: s.pct, reset: s.reset, windowMs: sessionMs, cfg },
+    { item: weeklyItem, icon: 'calendar', label: 'W', name: 'Weekly', pct: w.pct, reset: w.reset, windowMs: weeklyMs, cfg },
+  ];
+  lastGoodAt = Date.now();
   renderItem(sessionItem, 'pulse', 'S', 'Session', s.pct, s.reset, cfg, sessionMs);
   renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg, weeklyMs);
 }
@@ -301,6 +357,7 @@ function deactivate() {
   if (timer) clearInterval(timer);
   if (activityTimer) clearInterval(activityTimer);
   if (debounceTimer) clearTimeout(debounceTimer);
+  if (staleTimer) clearInterval(staleTimer);
 }
 
 module.exports = { activate, deactivate };
