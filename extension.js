@@ -11,8 +11,9 @@ const https = require('https');
 
 let sessionItem, weeklyItem, pollTimer;
 let hasData = false;     // have we ever rendered real values?
-let backoffAttempt = 0;  // consecutive-failure count for full-jitter backoff
-let backoffUntil = 0;    // skip polling until this timestamp (ms) after a 429
+let backoffAttempt = 0;  // 0-based consecutive-failure index for decorrelated-jitter backoff
+let backoffPrev = 0;     // Polly V2 running value (previous uncapped formula output)
+let backoffUntil = 0;    // skip polling until this timestamp (ms) after a failure
 let activityTimer;       // local poll of Claude Code logs
 let debounceTimer;       // settle timer before an activity-triggered refresh
 let lastLogMtime = 0;    // newest .jsonl mtime seen so far
@@ -30,7 +31,9 @@ function getCfg() {
     refreshBaseSeconds: c.get('refreshBaseSeconds', c.get('refreshIntervalSeconds', 90)),
     refreshJitterPct: c.get('refreshJitterPct', 0.2),
     backoffBaseSeconds: c.get('backoffBaseSeconds', 2),
+    backoffMedianFirstSeconds: c.get('backoffMedianFirstSeconds', c.get('backoffBaseSeconds', 2)),
     backoffCapSeconds: c.get('backoffCapSeconds', 300),
+    startupSplaySeconds: c.get('startupSplaySeconds', 5),
     syncToActivity: c.get('syncToActivity', true),
     activityPollSeconds: c.get('activityPollSeconds', 5),
     activityDebounceSeconds: c.get('activityDebounceSeconds', 4),
@@ -212,6 +215,18 @@ function showError(kind) {
   }
 }
 
+// Neutral placeholder shown at activation while the startup-splay timer waits,
+// so the bar isn't blank before the first real poll lands.
+function renderLoading() {
+  for (const [it, ic, lb] of [[sessionItem, 'pulse', 'S'], [weeklyItem, 'calendar', 'W']]) {
+    it.text = `$(${ic}) ${lb} …`;
+    it.color = new vscode.ThemeColor('descriptionForeground');
+    it.backgroundColor = undefined;
+    it.tooltip = 'Loading Claude usage…';
+    it.show();
+  }
+}
+
 // Re-render both items from the last good values, greyed, with the current
 // spinner frame — signals "stale, refreshing" without losing the numbers.
 function renderStale() {
@@ -265,10 +280,11 @@ async function refresh() {
   const cfg = getCfg();
   const r = await fetchUsage(cfg);
   if (r.error) {
-    // Full-jitter exponential backoff after ANY failure; 429 Retry-After is a floor.
+    // Decorrelated-jitter backoff after ANY failure; 429 Retry-After is a floor.
+    const i = backoffAttempt;          // 0-based index (first failure uses i=0)
     backoffAttempt++;
     const retryAfter = r.error === 'http-429' ? (r.retryAfter || 0) : 0;
-    const delay = backoffDelayMs(cfg, backoffAttempt, retryAfter);
+    const delay = backoffDelayMs(cfg, i, retryAfter);
     backoffUntil = Date.now() + delay;
     scheduleNextPoll(delay);
     // Swallow transient errors once we have data — keep the last good values visible.
@@ -279,6 +295,7 @@ async function refresh() {
   }
   hasData = true;
   backoffAttempt = 0;
+  backoffPrev = 0;
   backoffUntil = 0;
   stopStale();
   scheduleNextPoll(nextPollDelayMs(cfg));
@@ -302,11 +319,16 @@ function nextPollDelayMs(cfg) {
   return base * j * 1000;
 }
 
-// AWS "full jitter": rand(0, min(cap, base*2^(attempt-1))); 429 floors at retryAfter.
-function backoffDelayMs(cfg, attempt, retryAfterSec) {
-  const ceil = Math.min(cfg.backoffCapSeconds, cfg.backoffBaseSeconds * 2 ** (attempt - 1));
-  const jittered = Math.random() * ceil;
-  return Math.max(retryAfterSec || 0, jittered) * 1000;
+// Polly DecorrelatedJitterBackoffV2 (George Polevoy): smooth, spike-free, with a
+// controlled MEDIAN first-retry delay. next = 2^t · tanh(√(4t)); delay = (next-prev)
+// · (1/1.4) · medianFirst. Carries backoffPrev across attempts; capped; Retry-After is a floor.
+function backoffDelayMs(cfg, i, retryAfterSec) {
+  const t = Math.min(i, 30) + Math.random();          // clamp exponent so 2^t can't overflow
+  const next = 2 ** t * Math.tanh(Math.sqrt(4 * t));
+  const delay = (next - backoffPrev) * (1 / 1.4) * cfg.backoffMedianFirstSeconds * 1000;
+  backoffPrev = next;
+  const capped = Math.min(cfg.backoffCapSeconds * 1000, Math.max(0, delay));
+  return Math.max((retryAfterSec || 0) * 1000, capped); // honor Retry-After as a floor
 }
 
 function scheduleNextPoll(ms) {
@@ -374,7 +396,11 @@ function activate(context) {
       }
     })
   );
-  refresh(); // self-schedules the next poll based on its outcome
+  // Startup splay: show a placeholder now, but fire the first real poll after a
+  // random 0–startupSplaySeconds delay so many windows/clients starting together
+  // (or reopening after an outage) don't all hit the API at t=0.
+  renderLoading();
+  scheduleNextPoll(Math.random() * getCfg().startupSplaySeconds * 1000);
   startActivityWatch(getCfg());
 }
 

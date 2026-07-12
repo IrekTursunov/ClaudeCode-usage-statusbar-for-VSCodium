@@ -2,7 +2,7 @@
   "name": "claude-usage-statusbar",
   "displayName": "Claude Code Usage (status bar)",
   "description": "Shows live Session and Weekly Claude Code usage % (from Anthropic's usage API) with colored progress bars.",
-  "version": "0.4.1",
+  "version": "0.6.0",
   "publisher": "local",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
@@ -30,15 +30,25 @@
           "default": 0.2,
           "description": "Random jitter applied to refreshBaseSeconds as a ± fraction (0.2 = ±20%, so a 90s base polls every ~72–108s)."
         },
-        "claudeUsage.backoffBaseSeconds": {
+        "claudeUsage.backoffMedianFirstSeconds": {
           "type": "number",
           "default": 2,
-          "description": "Base for full-jitter exponential backoff after a failed usage call. Wait = random(0, min(backoffCapSeconds, base·2^(n-1))) for the n-th consecutive failure."
+          "description": "Median first-retry delay (seconds) for the decorrelated-jitter (Polly V2) backoff after a failed usage call. Later retries grow smoothly toward backoffCapSeconds; a 429 Retry-After header is honored as a floor."
         },
         "claudeUsage.backoffCapSeconds": {
           "type": "number",
           "default": 300,
           "description": "Maximum backoff window (seconds) after repeated failures. A 429 response's Retry-After is always honored as a floor."
+        },
+        "claudeUsage.startupSplaySeconds": {
+          "type": "number",
+          "default": 5,
+          "description": "Randomize the first poll after activation by 0–N seconds, so many windows/clients starting at once (or reopening after an outage) don't all hit the API simultaneously."
+        },
+        "claudeUsage.backoffBaseSeconds": {
+          "type": "number",
+          "default": 2,
+          "description": "Legacy: seeds the default for backoffMedianFirstSeconds when that is unset. No longer used directly once backoffMedianFirstSeconds is configured."
         },
         "claudeUsage.refreshIntervalSeconds": {
           "type": "number",

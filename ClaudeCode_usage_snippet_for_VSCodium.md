@@ -157,13 +157,19 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
 3. `pct = round(utilization)`, render `$(icon) <S|W> <pct>% <bar>` with the color from §3, followed
    by the sand-timer reset gauge (§2a, no text), and a tooltip showing the % and the time
    remaining until reset as plain text (e.g. `5h 30m`).
-4. Refresh shortly after request activity (§3a, debounced from local `.jsonl` log writes), with
-   `refreshIntervalSeconds` (default 300, min 15) as an idle safety net, plus on demand via
-   `claudeUsage.refresh`.
+4. Refresh shortly after request activity (§3a, debounced from local `.jsonl` log writes), with the
+   idle poll interval (`refreshBaseSeconds`, jittered ±`refreshJitterPct`) as a safety net, plus on
+   demand via `claudeUsage.refresh`. The **first** poll after activation is delayed by a random
+   `0–startupSplaySeconds` (a neutral `…` placeholder shows meanwhile) so many windows/clients
+   starting together don't all hit the API at `t=0`.
 5. On `401` / parse errors, show a muted `—` state with an explanatory tooltip. **Transient** errors
    (HTTP 429, 5xx, network, timeout) are **swallowed once data exists** — the last good values stay
-   on screen instead of flashing an error. On HTTP 429 the extension **backs off** (honoring the
-   `Retry-After` header, else 5 min) and skips polling until the backoff expires.
+   on screen (greyed, with a spinner) instead of flashing an error. After **any** failure the
+   extension **backs off** using **decorrelated jitter** (Polly's `DecorrelatedJitterBackoffV2`):
+   `t = attempt + rand()`, `next = 2^t·tanh(√(4t))`, `delay = (next − prev)·(1/1.4)·backoffMedianFirstSeconds`,
+   capped at `backoffCapSeconds` and floored by a 429 `Retry-After` header. This gives a smooth,
+   spike-free retry distribution with a controlled **median** first-retry delay, and de-synchronizes
+   clients so they don't retry in lockstep after a shared outage. A success resets the backoff.
 
 ---
 
