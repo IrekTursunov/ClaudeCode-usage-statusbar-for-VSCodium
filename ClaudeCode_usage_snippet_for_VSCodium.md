@@ -55,8 +55,9 @@ A **second** dimension — how much **time is left** in the window before it res
   the usage %, and emoji glyphs render in their own font color. So inline, urgency is conveyed by the
   **glyph + how much sand is left**, not by recoloring. The **colored** inverted gauge (green when
   lots of time remains → red as the reset nears) lives in the **hover tooltip** via HTML spans.
-- Toggle with `claudeUsage.showResetGauge`; tune urgency colors with
-  `claudeUsage.timeWarnPct`/`timeHighPct`/`timeCritPct` (percent of window **elapsed**).
+- Toggle with `claudeUsage.showResetGauge`. (The colored tooltip gauge and its
+  `timeWarnPct`/`timeHighPct`/`timeCritPct` settings were dropped in v0.5.0/v0.7.0; the tooltip now
+  shows the time remaining as plain text.)
 
 ---
 

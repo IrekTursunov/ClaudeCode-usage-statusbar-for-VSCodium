@@ -6,7 +6,7 @@ Guidance for Claude Code working in this repo. **The repo root *is* the VSCodium
 ## What this is
 
 A VSCodium extension that shows live Claude Code **Session** (5h) and **Weekly** (7d) usage % in the
-status bar with colored progress bars and a resets-in sand-timer gauge. Current version: **v0.4.0**.
+status bar with colored progress bars and a resets-in sand-timer gauge. Current version: **v0.7.0**.
 
 - `extension.js` — the entire extension (single file, see Conventions).
 - `package.json` — manifest.
