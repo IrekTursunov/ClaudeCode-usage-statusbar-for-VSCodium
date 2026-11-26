@@ -5,6 +5,10 @@ VSCodium extension that shows **Claude Code usage** in the status bar — **Sess
 are the **real** values from Anthropic's usage endpoint (the same data Claude Code's `/usage` screen
 shows), not a local estimate. No npm dependencies.
 
+![Session and Weekly usage in the VSCodium status bar (v0.7.0)](docs/statusbar-v0.7.0.png)
+
+*Session 51 % and Weekly 31 % with their progress bars and "resets in" sand-timer gauges (v0.7.0, live).*
+
 Full design rationale, mockups, and color thresholds:
 [`ClaudeCode_usage_snippet_for_VSCodium.md`](ClaudeCode_usage_snippet_for_VSCodium.md).
 
