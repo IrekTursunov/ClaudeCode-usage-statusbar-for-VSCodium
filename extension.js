@@ -13,42 +13,49 @@ let sessionItem, weeklyItem, pollTimer;
 let hasData = false;     // have we ever rendered real values?
 let backoffAttempt = 0;  // 0-based consecutive-failure index for decorrelated-jitter backoff
 let backoffPrev = 0;     // Polly V2 running value (previous uncapped formula output)
-let backoffUntil = 0;    // skip polling until this timestamp (ms) after a failure
+let backoffUntil = 0;    // no unscheduled API call before this timestamp (ms)
+let retryAfterUntil = 0; // server-mandated 429 Retry-After (ms); even manual clicks respect it
 let activityTimer;       // local poll of Claude Code logs
 let debounceTimer;       // settle timer before an activity-triggered refresh
 let lastLogMtime = 0;    // newest .jsonl mtime seen so far
 let lastApiAttempt = 0;  // when refresh() last hit the network
-let lastValues = null;   // [{ item, icon, label, name, pct, reset, windowMs }] last good render
+let lastValues = null;   // [{ item, label, name, pct, reset, windowMs, cfg }] last good render
 let lastGoodAt = 0;      // when lastValues was captured (ms)
 let staleTimer;          // spinner animation interval while showing stale values
 let spinFrame = 0;       // spinner frame index
+let inFlight = null;     // promise of the refresh currently running (callers coalesce onto it)
+let currentReq = null;   // in-flight https request, aborted by deactivate()
+let disposed = false;    // set by deactivate(); nothing may schedule work after it
+let storageDir = null;   // context.globalStorageUri — shared by all windows of this profile
+
+// Clamp a numeric setting into [lo, hi]; anything non-numeric falls back to d.
+// settings.json edits bypass the schema bounds in package.json, so don't trust them.
+function num(v, lo, hi, d) {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d;
+}
 
 function getCfg() {
   const c = vscode.workspace.getConfiguration('claudeUsage');
   const home = os.homedir();
   return {
     credentialsPath: (c.get('credentialsPath') || '~/.claude/.credentials.json').replace(/^~(?=$|[/\\])/, home),
-    refreshBaseSeconds: c.get('refreshBaseSeconds', c.get('refreshIntervalSeconds', 90)),
-    refreshJitterPct: c.get('refreshJitterPct', 0.2),
-    backoffBaseSeconds: c.get('backoffBaseSeconds', 2),
-    backoffMedianFirstSeconds: c.get('backoffMedianFirstSeconds', c.get('backoffBaseSeconds', 2)),
-    backoffCapSeconds: c.get('backoffCapSeconds', 300),
-    startupSplaySeconds: c.get('startupSplaySeconds', 5),
+    refreshBaseSeconds: num(c.get('refreshBaseSeconds'), 15, 3600, 90),
+    refreshJitterPct: num(c.get('refreshJitterPct'), 0, 0.5, 0.2),
+    backoffMedianFirstSeconds: num(c.get('backoffMedianFirstSeconds'), 0.5, 60, 2),
+    backoffCapSeconds: num(c.get('backoffCapSeconds'), 30, 3600, 300),
+    startupSplaySeconds: num(c.get('startupSplaySeconds'), 0, 60, 5),
     syncToActivity: c.get('syncToActivity', true),
-    activityPollSeconds: c.get('activityPollSeconds', 5),
-    activityDebounceSeconds: c.get('activityDebounceSeconds', 4),
-    activityMinIntervalSeconds: c.get('activityMinIntervalSeconds', 20),
-    segments: c.get('barSegments', 7),
-    warn: c.get('warnThreshold', 60),
-    high: c.get('highThreshold', 80),
-    critical: c.get('criticalThreshold', 95),
+    activityPollSeconds: num(c.get('activityPollSeconds'), 1, 60, 5),
+    activityDebounceSeconds: num(c.get('activityDebounceSeconds'), 1, 60, 4),
+    activityMinIntervalSeconds: num(c.get('activityMinIntervalSeconds'), 5, 600, 20),
+    segments: Math.round(num(c.get('barSegments'), 1, 20, 7)),
+    warn: num(c.get('warnThreshold'), 0, 100, 60),
+    high: num(c.get('highThreshold'), 0, 100, 80),
+    critical: num(c.get('criticalThreshold'), 0, 100, 95),
     betaHeader: c.get('betaHeader', 'oauth-2025-04-20'),
     showResetGauge: c.get('showResetGauge', true),
-    sessionWindowHours: c.get('sessionWindowHours', 5),
-    weeklyWindowDays: c.get('weeklyWindowDays', 7),
-    timeWarn: c.get('timeWarnPct', 50),
-    timeHigh: c.get('timeHighPct', 75),
-    timeCrit: c.get('timeCritPct', 90),
+    sessionWindowHours: num(c.get('sessionWindowHours'), 0.1, 168, 5),
+    weeklyWindowDays: num(c.get('weeklyWindowDays'), 0.1, 31, 7),
   };
 }
 
@@ -60,48 +67,79 @@ function readToken(cfg) {
 }
 
 // GET https://api.anthropic.com/api/oauth/usage with the OAuth bearer token.
+// Settles exactly once on every path and never rejects: a connection dropped mid-body
+// emits no 'end', and a bad header value makes https.request() throw synchronously.
 function fetchUsage(cfg) {
   return new Promise((resolve) => {
-    const { token, expiresAt } = readToken(cfg);
-    if (!token) return resolve({ error: 'no-token' });
-    if (expiresAt && expiresAt < Date.now()) return resolve({ error: 'auth' });
-    const req = https.request({
-      hostname: 'api.anthropic.com',
-      path: '/api/oauth/usage',
-      method: 'GET',
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'anthropic-beta': cfg.betaHeader,
-        'anthropic-version': '2023-06-01',
-        'User-Agent': 'claude-usage-statusbar',
-      },
-    }, (res) => {
-      let body = '';
-      res.on('data', (c) => (body += c));
-      res.on('end', () => {
-        if (res.statusCode === 401) return resolve({ error: 'auth' });
-        if (res.statusCode === 429) {
-          const ra = parseInt(res.headers['retry-after'], 10);
-          return resolve({ error: 'http-429', retryAfter: Number.isFinite(ra) ? ra : null });
-        }
-        if (res.statusCode !== 200) return resolve({ error: 'http-' + res.statusCode });
-        try { resolve({ data: JSON.parse(body) }); } catch { resolve({ error: 'parse' }); }
+    let req;
+    let done = false;
+    let deadline;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(deadline);
+      if (currentReq === req) currentReq = null;
+      resolve(v);
+    };
+    deadline = setTimeout(() => { finish({ error: 'timeout' }); if (req) req.destroy(); }, 20000);
+    try {
+      const { token, expiresAt } = readToken(cfg);
+      if (!token) return finish({ error: 'no-token' });
+      if (expiresAt && expiresAt < Date.now()) return finish({ error: 'auth' });
+      req = https.request({
+        hostname: 'api.anthropic.com',
+        path: '/api/oauth/usage',
+        method: 'GET',
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'anthropic-beta': cfg.betaHeader,
+          'anthropic-version': '2023-06-01',
+          'User-Agent': 'claude-usage-statusbar',
+        },
+      }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
+        res.on('error', () => finish({ error: 'network' }));
+        res.on('close', () => finish({ error: 'network' })); // no-op once 'end' has settled
+        res.on('end', () => {
+          if (res.statusCode === 401) return finish({ error: 'auth' });
+          if (res.statusCode === 429) {
+            const ra = parseInt(res.headers['retry-after'], 10);
+            return finish({ error: 'http-429', retryAfter: Number.isFinite(ra) && ra > 0 ? ra : null });
+          }
+          if (res.statusCode !== 200) return finish({ error: 'http-' + res.statusCode });
+          try { finish({ data: JSON.parse(body) }); } catch { finish({ error: 'parse' }); }
+        });
       });
-    });
-    req.on('error', () => resolve({ error: 'network' }));
-    req.setTimeout(15000, () => { req.destroy(); resolve({ error: 'timeout' }); });
-    req.end();
+      currentReq = req;
+      req.on('error', () => finish({ error: 'network' }));
+      req.setTimeout(15000, () => { finish({ error: 'timeout' }); req.destroy(); });
+      req.end();
+    } catch {
+      finish({ error: 'config' }); // e.g. ERR_INVALID_CHAR from betaHeader or the token
+    }
   });
 }
 
 // Prefer five_hour/seven_day.utilization; fall back to the limits[] array.
+// Tolerates any JSON shape: unexpected values read as "not reported".
 function pick(d, key, group) {
-  const block = d[key];
-  if (block && typeof block.utilization === 'number') {
+  const block = d && d[key];
+  if (block && Number.isFinite(block.utilization)) {
     return { pct: block.utilization, reset: block.resets_at };
   }
-  const lim = (d.limits || []).find((l) => l.group === group || l.kind === group);
-  return lim ? { pct: lim.percent, reset: lim.resets_at } : { pct: null, reset: null };
+  const lims = d && Array.isArray(d.limits) ? d.limits : [];
+  const lim = lims.find((l) => l && (l.group === group || l.kind === group));
+  return lim && Number.isFinite(lim.percent) ? { pct: lim.percent, reset: lim.resets_at } : { pct: null, reset: null };
+}
+
+// null if the payload is usable, else the error kind to report.
+function validate(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return 'parse';
+  const s = pick(d, 'five_hour', 'session');
+  const w = pick(d, 'seven_day', 'weekly');
+  return s.pct == null && w.pct == null ? 'schema' : null;
 }
 
 function bar(pct, segments) {
@@ -144,15 +182,6 @@ function sandBar(frac, cells) {
   return out;
 }
 
-// Inverted urgency by time left → hex (green when full, red as reset nears).
-function timeColorHex(frac, cfg) {
-  const elapsed = (1 - frac) * 100;
-  if (elapsed >= cfg.timeCrit) return '#F14C4C';
-  if (elapsed >= cfg.timeHigh) return '#D7894E';
-  if (elapsed >= cfg.timeWarn) return '#E2C08D';
-  return '#89D185';
-}
-
 function resetsIn(iso) {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return null;
@@ -185,7 +214,6 @@ function renderItem(item, icon, label, name, pct, reset, cfg, windowMs) {
   item.color = new vscode.ThemeColor(color);
   item.backgroundColor = bg ? new vscode.ThemeColor(bg) : undefined;
   const md = new vscode.MarkdownString(undefined, true);
-  md.supportHtml = true;
   md.appendMarkdown(`**Claude Code — ${name} usage**\n\n`);
   md.appendMarkdown(`- Used: **${p}%** ${bar(p, cfg.segments)}\n`);
   if (r != null) {
@@ -204,6 +232,9 @@ function showError(kind) {
     'network': 'No network connection.',
     'timeout': 'Usage request timed out.',
     'parse': 'Unexpected response from the usage API.',
+    'schema': 'The usage API returned no Session/Weekly data (response format changed?).',
+    'config': 'Request could not be built — check claudeUsage.betaHeader and the credentials file.',
+    'internal': 'Internal error — see Help › Toggle Developer Tools › Console.',
     'http-429': 'Rate-limited by the usage API — backing off.',
   }[kind] || ('Usage error: ' + kind);
   for (const [it, ic, lb] of [[sessionItem, 'pulse', 'S'], [weeklyItem, 'calendar', 'W']]) {
@@ -274,49 +305,115 @@ function stopStale() {
   if (staleTimer) { clearInterval(staleTimer); staleTimer = undefined; }
 }
 
-async function refresh() {
-  if (Date.now() < backoffUntil) return; // still inside an active backoff window
-  lastApiAttempt = Date.now();
-  const cfg = getCfg();
-  const r = await fetchUsage(cfg);
-  if (r.error) {
-    // Decorrelated-jitter backoff after ANY failure; 429 Retry-After is a floor.
-    const i = backoffAttempt;          // 0-based index (first failure uses i=0)
-    backoffAttempt++;
-    const retryAfter = r.error === 'http-429' ? (r.retryAfter || 0) : 0;
-    const delay = backoffDelayMs(cfg, i, retryAfter);
-    backoffUntil = Date.now() + delay;
-    scheduleNextPoll(delay);
-    // Swallow transient errors once we have data — keep the last good values visible.
-    const transient = r.error === 'http-429' || r.error === 'network' ||
-      r.error === 'timeout' || /^http-5/.test(r.error);
-    if (transient && hasData) { startStale(); return; }
-    return showError(r.error);
+// One usage snapshot shared by every window of this profile, so N windows reacting
+// to the same Claude Code turn make one API call instead of N. Only the fields we
+// render are stored — never the token.
+function sharedPath() {
+  return storageDir ? path.join(storageDir, 'last-usage.json') : null;
+}
+
+function readShared(cfg) {
+  const p = sharedPath();
+  if (!p) return null;
+  try {
+    const o = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const age = Date.now() - o.at;
+    if (age >= 0 && age < cfg.activityMinIntervalSeconds * 1000 && !validate(o.data)) return o;
+  } catch { /* missing or unreadable — fetch instead */ }
+  return null;
+}
+
+function writeShared(d) {
+  const p = sharedPath();
+  if (!p) return;
+  try {
+    fs.mkdirSync(storageDir, { recursive: true });
+    const tmp = `${p}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ at: Date.now(), data: { five_hour: d.five_hour, seven_day: d.seven_day, limits: d.limits } }));
+    fs.renameSync(tmp, p); // atomic: other windows never read a half-written file
+  } catch { /* best effort */ }
+}
+
+// Single entry point for every trigger: poll timer, click, activity, settings change.
+//   opts.scheduled — fired by pollTimer: it IS the pending retry, so it skips the backoff guard.
+//   opts.manual    — click / settings change: skips our own backoff and the shared snapshot,
+//                    but still respects a server 429 Retry-After.
+function refresh(opts = {}) {
+  if (disposed) return Promise.resolve();
+  if (inFlight) return inFlight; // coalesce: never two requests at once, never out-of-order renders
+  if (!opts.scheduled) {
+    const wait = (opts.manual ? retryAfterUntil : backoffUntil) - Date.now();
+    if (wait > 0) {
+      if (opts.manual) {
+        vscode.window.setStatusBarMessage(`Claude usage: rate-limited — retry in ${Math.ceil(wait / 1000)}s`, 4000);
+      }
+      return Promise.resolve(); // the scheduled retry is still pending
+    }
   }
-  hasData = true;
+  inFlight = runRefresh(opts).finally(() => { inFlight = null; });
+  return inFlight;
+}
+
+async function runRefresh(opts) {
+  const cfg = getCfg();
+  let next = nextPollDelayMs(cfg);
+  try {
+    const shared = opts.manual ? null : readShared(cfg);
+    if (shared) { onSuccess(cfg, shared.data, shared.at); return; }
+    lastApiAttempt = Date.now();
+    const r = await fetchUsage(cfg);
+    if (disposed) return;
+    const err = r.error || validate(r.data);
+    if (err) { next = onFailure(cfg, err, r.retryAfter); return; }
+    writeShared(r.data);
+    onSuccess(cfg, r.data, Date.now());
+  } catch (e) {
+    console.error('[claude-usage] refresh failed:', e);
+    if (!disposed) showError('internal');
+  } finally {
+    if (!disposed) scheduleNextPoll(next); // always — no failure may end the poll loop
+  }
+}
+
+// Decorrelated-jitter backoff after ANY failure; a 429 Retry-After is a floor.
+// Returns the delay until the scheduled retry.
+function onFailure(cfg, kind, retryAfterSec) {
+  const ra = kind === 'http-429' ? (retryAfterSec || 0) : 0;
+  const delay = Math.ceil(backoffDelayMs(cfg, backoffAttempt, ra));
+  backoffAttempt++;
+  backoffUntil = Date.now() + delay;
+  retryAfterUntil = ra ? Date.now() + ra * 1000 : 0;
+  // Swallow transient errors once we have data — keep the last good values visible.
+  const transient = kind === 'http-429' || kind === 'network' ||
+    kind === 'timeout' || /^http-5/.test(kind);
+  if (transient && hasData) startStale(); else showError(kind);
+  return delay;
+}
+
+function onSuccess(cfg, d, at) {
   backoffAttempt = 0;
   backoffPrev = 0;
   backoffUntil = 0;
+  retryAfterUntil = 0;
   stopStale();
-  scheduleNextPoll(nextPollDelayMs(cfg));
-  const s = pick(r.data, 'five_hour', 'session');
-  const w = pick(r.data, 'seven_day', 'weekly');
+  const s = pick(d, 'five_hour', 'session');
+  const w = pick(d, 'seven_day', 'weekly');
   const sessionMs = cfg.sessionWindowHours * 3600e3;
   const weeklyMs = cfg.weeklyWindowDays * 86400e3;
   lastValues = [
-    { item: sessionItem, icon: 'pulse', label: 'S', name: 'Session', pct: s.pct, reset: s.reset, windowMs: sessionMs, cfg },
-    { item: weeklyItem, icon: 'calendar', label: 'W', name: 'Weekly', pct: w.pct, reset: w.reset, windowMs: weeklyMs, cfg },
+    { item: sessionItem, label: 'S', name: 'Session', pct: s.pct, reset: s.reset, windowMs: sessionMs, cfg },
+    { item: weeklyItem, label: 'W', name: 'Weekly', pct: w.pct, reset: w.reset, windowMs: weeklyMs, cfg },
   ];
-  lastGoodAt = Date.now();
+  lastGoodAt = at;
   renderItem(sessionItem, 'pulse', 'S', 'Session', s.pct, s.reset, cfg, sessionMs);
   renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg, weeklyMs);
+  hasData = true;
 }
 
-// Idle poll delay: base ±jitterPct (floored at 15s), so clients de-synchronize.
+// Idle poll delay: base ±jitterPct, floored at 15s, so clients de-synchronize.
 function nextPollDelayMs(cfg) {
-  const base = Math.max(15, cfg.refreshBaseSeconds);
   const j = 1 + (Math.random() * 2 - 1) * cfg.refreshJitterPct; // 1 ± pct
-  return base * j * 1000;
+  return Math.max(15000, cfg.refreshBaseSeconds * j * 1000);
 }
 
 // Polly DecorrelatedJitterBackoffV2 (George Polevoy): smooth, spike-free, with a
@@ -325,15 +422,21 @@ function nextPollDelayMs(cfg) {
 function backoffDelayMs(cfg, i, retryAfterSec) {
   const t = Math.min(i, 30) + Math.random();          // clamp exponent so 2^t can't overflow
   const next = 2 ** t * Math.tanh(Math.sqrt(4 * t));
-  const delay = (next - backoffPrev) * (1 / 1.4) * cfg.backoffMedianFirstSeconds * 1000;
+  const raw = (next - backoffPrev) * (1 / 1.4) * cfg.backoffMedianFirstSeconds * 1000;
   backoffPrev = next;
-  const capped = Math.min(cfg.backoffCapSeconds * 1000, Math.max(0, delay));
-  return Math.max((retryAfterSec || 0) * 1000, capped); // honor Retry-After as a floor
+  const capMs = cfg.backoffCapSeconds * 1000;
+  // Once the exponent is clamped, next and prev share a range and raw can be ≤ 0:
+  // stay at the cap instead of retrying instantly. 1s floor guards the low end.
+  const delay = raw > 0 ? Math.min(capMs, raw) : capMs;
+  return Math.max(1000, (retryAfterSec || 0) * 1000, delay);
 }
 
 function scheduleNextPoll(ms) {
   if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = setTimeout(refresh, ms);
+  pollTimer = undefined;
+  if (disposed) return;
+  // Math.ceil: timers run on the loop's integer-ms clock; never fire before backoffUntil.
+  pollTimer = setTimeout(() => refresh({ scheduled: true }), Math.ceil(ms));
 }
 
 // ~/.claude/projects — where Claude Code appends per-request session logs.
@@ -363,12 +466,13 @@ function newestLogMtime(cfg) {
   return newest;
 }
 
-// Debounced, rate-guarded refresh after request activity settles.
+// Debounced, rate-guarded refresh after request activity settles. The debounce is
+// jittered 1–2× so windows watching the same logs don't call the API in lockstep.
 function scheduleActivityRefresh(cfg) {
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     if (Date.now() - lastApiAttempt >= cfg.activityMinIntervalSeconds * 1000) refresh();
-  }, Math.max(1, cfg.activityDebounceSeconds) * 1000);
+  }, cfg.activityDebounceSeconds * 1000 * (1 + Math.random()));
 }
 
 // Poll the logs locally; when a request is logged, trigger a refresh.
@@ -380,19 +484,23 @@ function startActivityWatch(cfg) {
   activityTimer = setInterval(() => {
     const m = newestLogMtime(cfg);
     if (m > lastLogMtime) { lastLogMtime = m; scheduleActivityRefresh(cfg); }
-  }, Math.max(1, cfg.activityPollSeconds) * 1000);
+  }, cfg.activityPollSeconds * 1000);
 }
 
 function activate(context) {
+  disposed = false;
+  storageDir = context.globalStorageUri ? context.globalStorageUri.fsPath : null;
   sessionItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   weeklyItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
   sessionItem.command = weeklyItem.command = 'claudeUsage.refresh';
   context.subscriptions.push(
     sessionItem, weeklyItem,
-    vscode.commands.registerCommand('claudeUsage.refresh', refresh),
+    vscode.commands.registerCommand('claudeUsage.refresh', () => refresh({ manual: true })),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('claudeUsage')) {
-        startActivityWatch(getCfg()); refresh();
+        // A settings fix (e.g. credentialsPath) applies now, not after the backoff.
+        backoffAttempt = 0; backoffPrev = 0; backoffUntil = 0;
+        startActivityWatch(getCfg()); refresh({ manual: true });
       }
     })
   );
@@ -405,10 +513,12 @@ function activate(context) {
 }
 
 function deactivate() {
-  if (pollTimer) clearTimeout(pollTimer);
+  disposed = true;
+  if (currentReq) { currentReq.destroy(); currentReq = null; }
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = undefined; }
   if (activityTimer) clearInterval(activityTimer);
   if (debounceTimer) clearTimeout(debounceTimer);
-  if (staleTimer) clearInterval(staleTimer);
+  stopStale();
 }
 
 module.exports = { activate, deactivate };

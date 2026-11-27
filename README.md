@@ -5,6 +5,10 @@ VSCodium extension that shows **Claude Code usage** in the status bar — **Sess
 are the **real** values from Anthropic's usage endpoint (the same data Claude Code's `/usage` screen
 shows), not a local estimate. No npm dependencies.
 
+![Session and Weekly usage in the VSCodium status bar (v0.7.0)](docs/statusbar-v0.7.0.png)
+
+*Session 51 % and Weekly 31 % with their progress bars and "resets in" sand-timer gauges (v0.7.0, live).*
+
 Full design rationale, mockups, and color thresholds:
 [`ClaudeCode_usage_snippet_for_VSCodium.md`](ClaudeCode_usage_snippet_for_VSCodium.md).
 
@@ -46,8 +50,14 @@ npx @vscode/vsce package
 ## Configure
 
 Settings → Extensions → **Claude Code Usage** (keys `claudeUsage.*`):
-`refreshIntervalSeconds` (default 60, min 15), `barSegments`, color thresholds
-(`warnThreshold` 60 / `highThreshold` 80 / `criticalThreshold` 95), `credentialsPath`, `betaHeader`.
+`refreshBaseSeconds` (default 90, ±`refreshJitterPct` 20 %, min 15), backoff
+(`backoffMedianFirstSeconds` 2 / `backoffCapSeconds` 300), activity sync (`syncToActivity`,
+`activityDebounceSeconds`, `activityMinIntervalSeconds`), `barSegments`, color thresholds
+(`warnThreshold` 60 / `highThreshold` 80 / `criticalThreshold` 95). `credentialsPath` and `betaHeader`
+are machine-scoped: set them in user settings, a workspace's `.vscode/settings.json` cannot override them.
+
+> v0.7.0 removed `refreshIntervalSeconds`, `backoffBaseSeconds` and `timeWarnPct`/`timeHighPct`/`timeCritPct`
+> (they had stopped having any effect). Use `refreshBaseSeconds` / `backoffMedianFirstSeconds` instead.
 
 ## Verify (no editor needed)
 

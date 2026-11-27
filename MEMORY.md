@@ -54,6 +54,27 @@ Response (relevant fields):
 - Every `refresh()` (timer, manual command, or activity-triggered) reschedules the poll, so the idle
   clock resets after any refresh.
 - Refreshes are also synced to Claude Code request activity (v0.4.0).
+- **Backoff is Polly V2 decorrelated jitter since v0.6.0** (the full-jitter formula above is history).
+
+## Poll-loop invariants (v0.7.0 — see review/CODE_REVIEW_2026-11-27.md)
+
+- **The loop must never end.** `runRefresh()` reschedules in `finally`, whatever happens. v0.4.1–v0.6.0
+  lost the loop three ways: the scheduled retry fired ~0.4 ms before the fractional `backoffUntil` and
+  was dropped by refresh()'s own guard (C1); `fetchUsage()` never settled on a mid-body connection
+  drop and rejected on an invalid header char (C2).
+- `refresh({ scheduled: true })` = the pending retry → skips the guard. `refresh({ manual: true })` =
+  click / settings change → skips our backoff and the shared snapshot, respects only a 429 Retry-After
+  (and says so via `setStatusBarMessage`). Plain `refresh()` = activity → fully guarded.
+- One request at a time: concurrent callers coalesce onto `inFlight` (no out-of-order renders).
+- `fetchUsage()` settles exactly once (`finish`), handles `res` `'error'`/`'close'`, has a 20 s hard
+  deadline and never throws (`'config'` error for bad header values).
+- `deactivate()` sets `disposed`, aborts `currentReq`; nothing schedules after it.
+- Backoff saturates at the cap (never 0 ms after the exponent clamp), 1 s floor; all numeric
+  settings are clamped in `getCfg()` (settings.json edits bypass the package.json bounds).
+- Payloads are validated: non-object → `'parse'`, neither Session nor Weekly present → `'schema'`.
+- Windows share `globalStorage/last-usage.json` (only five_hour/seven_day/limits, never the token);
+  a snapshot younger than `activityMinIntervalSeconds` is rendered instead of calling the API.
+- `credentialsPath` / `betaHeader` are `"scope": "machine"`.
 
 ## Environment notes
 
@@ -64,7 +85,10 @@ Response (relevant fields):
 
 ## Status
 
-- **v0.4.1** current. Adds jittered idle poll (90s ±20%) and full-jitter exponential backoff after
+- **v0.7.0** current: poll-loop resilience fixes (see "Poll-loop invariants"); removed the dead
+  `refreshIntervalSeconds`, `backoffBaseSeconds`, `timeWarnPct`/`timeHighPct`/`timeCritPct` settings.
+- **v0.6.0**: decorrelated-jitter (Polly V2) backoff + startup splay. **v0.5.0**: plain-text "Resets in" tooltip.
+- **v0.4.1**: Adds jittered idle poll (90s ±20%) and full-jitter exponential backoff after
   any failure (429 Retry-After as floor). See "Transient errors vs. real errors".
 - **v0.4.0**: live values verified against `/usage`. Resets-in sand-timer gauge, 429 hardening,
   usage refresh synced to Claude Code request activity, stale-spinner (keeps last good values greyed

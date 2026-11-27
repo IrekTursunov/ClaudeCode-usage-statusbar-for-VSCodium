@@ -19,3 +19,6 @@ Thumbs.db
 *.credentials.json
 .env
 .env.*
+
+# Local code-review notes and repro harnesses (2026-11-27 review) — kept on this machine only.
+review/

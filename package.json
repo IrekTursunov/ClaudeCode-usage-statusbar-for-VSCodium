@@ -2,7 +2,7 @@
   "name": "claude-usage-statusbar",
   "displayName": "Claude Code Usage (status bar)",
   "description": "Shows live Session and Weekly Claude Code usage % (from Anthropic's usage API) with colored progress bars.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "local",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
@@ -18,67 +18,77 @@
         "claudeUsage.credentialsPath": {
           "type": "string",
           "default": "~/.claude/.credentials.json",
-          "description": "Path to the Claude Code OAuth credentials file (read locally; the token is sent only to api.anthropic.com)."
+          "scope": "machine",
+          "description": "Path to the Claude Code OAuth credentials file (read locally; the token is sent only to api.anthropic.com). User/machine setting only — workspace settings cannot override it."
         },
         "claudeUsage.refreshBaseSeconds": {
           "type": "number",
           "default": 90,
+          "minimum": 15,
+          "maximum": 3600,
           "description": "Base idle poll interval (seconds; min 15). Each poll is jittered by ±refreshJitterPct so clients de-synchronize. With syncToActivity on, refreshes are mainly driven by request activity; this timer just catches resets/idle."
         },
         "claudeUsage.refreshJitterPct": {
           "type": "number",
           "default": 0.2,
-          "description": "Random jitter applied to refreshBaseSeconds as a ± fraction (0.2 = ±20%, so a 90s base polls every ~72–108s)."
+          "minimum": 0,
+          "maximum": 0.5,
+          "description": "Random jitter applied to refreshBaseSeconds as a ± fraction (0.2 = ±20%, so a 90s base polls every ~72–108s). Max 0.5."
         },
         "claudeUsage.backoffMedianFirstSeconds": {
           "type": "number",
           "default": 2,
+          "minimum": 0.5,
+          "maximum": 60,
           "description": "Median first-retry delay (seconds) for the decorrelated-jitter (Polly V2) backoff after a failed usage call. Later retries grow smoothly toward backoffCapSeconds; a 429 Retry-After header is honored as a floor."
         },
         "claudeUsage.backoffCapSeconds": {
           "type": "number",
           "default": 300,
+          "minimum": 30,
+          "maximum": 3600,
           "description": "Maximum backoff window (seconds) after repeated failures. A 429 response's Retry-After is always honored as a floor."
         },
         "claudeUsage.startupSplaySeconds": {
           "type": "number",
           "default": 5,
+          "minimum": 0,
+          "maximum": 60,
           "description": "Randomize the first poll after activation by 0–N seconds, so many windows/clients starting at once (or reopening after an outage) don't all hit the API simultaneously."
         },
-        "claudeUsage.backoffBaseSeconds": {
-          "type": "number",
-          "default": 2,
-          "description": "Legacy: seeds the default for backoffMedianFirstSeconds when that is unset. No longer used directly once backoffMedianFirstSeconds is configured."
-        },
-        "claudeUsage.refreshIntervalSeconds": {
-          "type": "number",
-          "default": 90,
-          "description": "Deprecated: alias for refreshBaseSeconds (used only if refreshBaseSeconds is unset)."
-        },
         "claudeUsage.barSegments": {
-          "type": "number",
+          "type": "integer",
           "default": 7,
+          "minimum": 1,
+          "maximum": 20,
           "description": "Number of segments in each progress bar."
         },
         "claudeUsage.warnThreshold": {
           "type": "number",
           "default": 60,
+          "minimum": 0,
+          "maximum": 100,
           "description": "Percent at which the gauge turns yellow."
         },
         "claudeUsage.highThreshold": {
           "type": "number",
           "default": 80,
+          "minimum": 0,
+          "maximum": 100,
           "description": "Percent at which the gauge turns orange (warning background)."
         },
         "claudeUsage.criticalThreshold": {
           "type": "number",
           "default": 95,
+          "minimum": 0,
+          "maximum": 100,
           "description": "Percent at which the gauge turns red (error background)."
         },
         "claudeUsage.betaHeader": {
           "type": "string",
           "default": "oauth-2025-04-20",
-          "description": "Value of the anthropic-beta header required by the OAuth usage endpoint."
+          "scope": "machine",
+          "description": "Value of the anthropic-beta header required by the OAuth usage endpoint. User/machine setting only — workspace settings cannot override it."
         },
         "claudeUsage.syncToActivity": {
           "type": "boolean",
@@ -88,47 +98,42 @@
         "claudeUsage.activityPollSeconds": {
           "type": "number",
           "default": 5,
+          "minimum": 1,
+          "maximum": 60,
           "description": "How often to check the Claude Code logs locally for new activity (seconds). This is a local file stat only; it never calls the usage API."
         },
         "claudeUsage.activityDebounceSeconds": {
           "type": "number",
           "default": 4,
-          "description": "How long to wait after the last logged request before refreshing usage, so a burst of requests triggers a single refresh."
+          "minimum": 1,
+          "maximum": 60,
+          "description": "How long to wait after the last logged request before refreshing usage (randomized up to 2× so multiple windows don't refresh in lockstep), so a burst of requests triggers a single refresh."
         },
         "claudeUsage.activityMinIntervalSeconds": {
           "type": "number",
           "default": 20,
-          "description": "Minimum gap between activity-triggered usage API calls, to protect the rate limit during heavy use."
+          "minimum": 5,
+          "maximum": 600,
+          "description": "Minimum gap between activity-triggered usage API calls, to protect the rate limit during heavy use. Also how long a usage snapshot fetched by another window is reused instead of calling the API again."
         },
         "claudeUsage.showResetGauge": {
           "type": "boolean",
           "default": true,
-          "description": "Show the 'resets in' sand-timer gauge (hourglass + draining braille cells + countdown) next to each usage bar."
+          "description": "Show the 'resets in' sand-timer gauge (hourglass + draining braille cells) next to each usage bar. The exact time remaining is in the hover tooltip."
         },
         "claudeUsage.sessionWindowHours": {
           "type": "number",
           "default": 5,
+          "minimum": 0.1,
+          "maximum": 168,
           "description": "Length of the Session window in hours (used to compute how much time is left for the reset gauge)."
         },
         "claudeUsage.weeklyWindowDays": {
           "type": "number",
           "default": 7,
+          "minimum": 0.1,
+          "maximum": 31,
           "description": "Length of the Weekly window in days (used to compute how much time is left for the reset gauge)."
-        },
-        "claudeUsage.timeWarnPct": {
-          "type": "number",
-          "default": 50,
-          "description": "Percent of the window elapsed at which the tooltip reset gauge turns yellow."
-        },
-        "claudeUsage.timeHighPct": {
-          "type": "number",
-          "default": 75,
-          "description": "Percent of the window elapsed at which the tooltip reset gauge turns orange."
-        },
-        "claudeUsage.timeCritPct": {
-          "type": "number",
-          "default": 90,
-          "description": "Percent of the window elapsed at which the tooltip reset gauge turns red."
         }
       }
     }
